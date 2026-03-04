@@ -13,12 +13,16 @@ from openpyxl import Workbook
 APP_API_KEY = os.getenv("APP_API_KEY", "")
 SERPAPI_KEY = os.getenv("SERPAPI_KEY", "")
 
-# blocca directory / terze parti
+# blocca directory / terze parti + news/magazine (falsi positivi frequenti)
 BLOCKED_DOMAINS = {
     "linkedin.com", "facebook.com", "instagram.com", "x.com", "twitter.com",
     "paginegialle.it", "paginebianche.it", "kompass.com", "europages.com",
     "crunchbase.com", "dnb.com", "bloomberg.com", "reuters.com", "wikipedia.org",
     "google.com", "maps.google.com", "google.it",
+
+    # news / magazine / portali (falsi positivi frequenti)
+    "alvolante.it", "quattroruote.it", "ilsole24ore.com", "repubblica.it",
+    "corriere.it", "ansa.it", "it.wikipedia.org", "wikipedia.it",
 }
 
 app = FastAPI()
@@ -56,40 +60,51 @@ def serpapi_search(company: str) -> List[str]:
     if not SERPAPI_KEY:
         raise RuntimeError("SERPAPI_KEY non configurata")
 
-    params = {
-        "engine": "google",
-        "q": f"\"{company}\" sito ufficiale",
-        "hl": "it",
-        "gl": "it",
-        "num": 10,
-        "api_key": SERPAPI_KEY,
-    }
-    r = requests.get("https://serpapi.com/search.json", params=params, timeout=30)
-    r.raise_for_status()
-    data = r.json()
+    # query più "corporate"
+    queries = [
+        f"\"{company}\" sito ufficiale",
+        f"\"{company}\" contatti",
+        f"\"{company}\" partita iva",
+    ]
 
-    urls = []
-    for item in (data.get("organic_results") or []):
-        link = item.get("link")
-        if link:
-            urls.append(link)
+    urls: List[str] = []
+    for q in queries:
+        params = {
+            "engine": "google",
+            "q": q,
+            "hl": "it",
+            "gl": "it",
+            "num": 10,
+            "api_key": SERPAPI_KEY,
+        }
+        r = requests.get("https://serpapi.com/search.json", params=params, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        for item in (data.get("organic_results") or []):
+            link = item.get("link")
+            if link:
+                urls.append(link)
+
+    # de-dup preservando ordine
+    seen = set()
+    urls = [u for u in urls if not (u in seen or seen.add(u))]
     return urls
 
 
 def pick_best_domain(company: str) -> Tuple[str, float]:
     """
     Strategia prudente:
-    - prende domini dai primi risultati
-    - scarta directory/terze parti
-    - verifica leggera su homepage
-    - se non supera soglia: NON TROVATO
+    - prende domini dai risultati
+    - scarta directory/terze parti/news
+    - scoring più severo se nome generico (1 token)
+    - fallback: prova primary.it / primary.com
     """
     try:
         urls = serpapi_search(company)
     except Exception:
         return "NON TROVATO", 0.0
 
-    candidates = []
+    candidates: List[str] = []
     for u in urls:
         host = normalize_domain(u)
         if not host or is_blocked(host):
@@ -100,10 +115,17 @@ def pick_best_domain(company: str) -> Tuple[str, float]:
     seen = set()
     candidates = [c for c in candidates if not (c in seen or seen.add(c))]
 
-    tokens = [t for t in re.split(r"\W+", company.lower()) if len(t) >= 4][:3]
+    # tokenizzazione più intelligente
+    raw_tokens = [t for t in re.split(r"\W+", company.lower()) if len(t) >= 3]
+    stop = {"spa", "s", "p", "a", "s.p.a", "s.p.a.", "srl", "s.r.l", "s.r.l.", "societa", "società",
+            "company", "group", "holding"}
+    tokens = [t for t in raw_tokens if t not in stop]
+    tokens = tokens[:3]
+    primary = tokens[0] if tokens else ""
+
     best = ("NON TROVATO", 0.0)
 
-    for dom in candidates[:5]:
+    for dom in candidates[:6]:
         try:
             resp = requests.get(f"https://{dom}", timeout=15, headers={"User-Agent": "Mozilla/5.0"})
             text = (resp.text or "").lower()
@@ -115,20 +137,63 @@ def pick_best_domain(company: str) -> Tuple[str, float]:
                 continue
 
         score = 0.0
-        if any(tok in text for tok in tokens):
-            score += 0.7
-        if "cookie" in text or "privacy" in text:
+
+        # 1) BOOST: il dominio contiene il token principale (ottimo segnale corporate)
+        if primary and primary in dom:
+            score += 0.6
+
+        # 2) presenza token nella pagina (prudente)
+        token_hits = sum(1 for tok in tokens if tok and tok in text)
+        if token_hits >= 2:
+            score += 0.6
+        elif token_hits == 1:
+            score += 0.25  # prudente: evita news/blog
+
+        # 3) segnali corporate tipici
+        if ("partita iva" in text) or ("p.iva" in text) or ("codice fiscale" in text) or ("vat" in text):
+            score += 0.35
+        if ("contatti" in text) or ("chi siamo" in text) or ("about" in text):
             score += 0.1
-        if "contatti" in text or "chi siamo" in text or "about" in text:
-            score += 0.1
-        if "directory" in text or "scheda azienda" in text:
-            score -= 0.4
+        if ("cookie" in text) or ("privacy" in text):
+            score += 0.05
+
+        # 4) penalità per siti editoriali/portalosi
+        if ("news" in text) or ("newsletter" in text) or ("articolo" in text) or ("abbonati" in text):
+            score -= 0.35
+        if ("directory" in text) or ("scheda azienda" in text):
+            score -= 0.5
+
+        # 5) regola anti-falso positivo: se ho solo 1 token e il dominio NON lo contiene,
+        # accetto solo con segnali legali (P.IVA/VAT) o ragione sociale completa nel testo
+        if len(tokens) <= 1 and primary and (primary not in dom):
+            if not (("partita iva" in text) or ("p.iva" in text) or ("vat" in text) or (company.lower() in text)):
+                score -= 0.6
 
         if score > best[1]:
             best = (dom, score)
 
-        if best[1] >= 0.8:
+        # stop early se molto convincente
+        if best[1] >= 0.9:
             break
+
+    # Fallback: se score basso e token corto/forte (es. ima), prova primary.it e primary.com
+    if best[1] < 0.75 and primary and 2 <= len(primary) <= 8:
+        for tld in ("it", "com"):
+            guess = f"{primary}.{tld}"
+            if is_blocked(guess):
+                continue
+            try:
+                resp = requests.get(f"https://{guess}", timeout=12, headers={"User-Agent": "Mozilla/5.0"})
+                text = (resp.text or "").lower()
+            except Exception:
+                try:
+                    resp = requests.get(f"http://{guess}", timeout=12, headers={"User-Agent": "Mozilla/5.0"})
+                    text = (resp.text or "").lower()
+                except Exception:
+                    continue
+
+            if ("partita iva" in text) or ("p.iva" in text) or ("vat" in text) or (primary in text):
+                return guess, 0.8
 
     if best[1] < 0.75:
         return "NON TROVATO", best[1]
