@@ -20,7 +20,7 @@ BLOCKED_DOMAINS = {
     "crunchbase.com", "dnb.com", "bloomberg.com", "reuters.com", "wikipedia.org",
     "google.com", "maps.google.com", "google.it",
 
-    # news / magazine / portali (falsi positivi frequenti)
+    # news / magazine / portali
     "alvolante.it", "quattroruote.it", "ilsole24ore.com", "repubblica.it",
     "corriere.it", "ansa.it", "it.wikipedia.org", "wikipedia.it",
 }
@@ -46,9 +46,28 @@ def normalize_domain(d: str) -> str:
     return d
 
 
+def to_root_domain(dom: str) -> str:
+    """
+    Converte sottodomini in root domain:
+    - carconfigurator.ferrari.com -> ferrari.com
+    - sub.company.co.uk -> company.co.uk
+    """
+    dom = normalize_domain(dom)
+    parts = dom.split(".")
+    if len(parts) <= 2:
+        return dom
+
+    two_level_tlds = {"co.uk", "com.au", "co.jp", "com.br", "com.tr"}
+    last2 = ".".join(parts[-2:])
+    last3 = ".".join(parts[-3:])
+
+    if last2 in two_level_tlds and len(parts) >= 3:
+        return last3
+    return last2
+
+
 def is_blocked(domain: str) -> bool:
     dom = normalize_domain(domain)
-    # blocco diretto e blocco su sottodomini
     for b in BLOCKED_DOMAINS:
         if dom == b or dom.endswith("." + b):
             return True
@@ -56,11 +75,10 @@ def is_blocked(domain: str) -> bool:
 
 
 def serpapi_search(company: str) -> List[str]:
-    """Ritorna una lista di URL candidati (ordinati)."""
+    """Ritorna URL candidati (ordinati) usando query più corporate."""
     if not SERPAPI_KEY:
         raise RuntimeError("SERPAPI_KEY non configurata")
 
-    # query più "corporate"
     queries = [
         f"\"{company}\" sito ufficiale",
         f"\"{company}\" contatti",
@@ -85,7 +103,6 @@ def serpapi_search(company: str) -> List[str]:
             if link:
                 urls.append(link)
 
-    # de-dup preservando ordine
     seen = set()
     urls = [u for u in urls if not (u in seen or seen.add(u))]
     return urls
@@ -98,6 +115,7 @@ def pick_best_domain(company: str) -> Tuple[str, float]:
     - scarta directory/terze parti/news
     - scoring più severo se nome generico (1 token)
     - fallback: prova primary.it / primary.com
+    - normalizza sempre a root domain
     """
     try:
         urls = serpapi_search(company)
@@ -111,45 +129,50 @@ def pick_best_domain(company: str) -> Tuple[str, float]:
             continue
         candidates.append(host)
 
-    # de-dup preservando ordine
     seen = set()
     candidates = [c for c in candidates if not (c in seen or seen.add(c))]
 
     # tokenizzazione più intelligente
     raw_tokens = [t for t in re.split(r"\W+", company.lower()) if len(t) >= 3]
-    stop = {"spa", "s", "p", "a", "s.p.a", "s.p.a.", "srl", "s.r.l", "s.r.l.", "societa", "società",
-            "company", "group", "holding"}
-    tokens = [t for t in raw_tokens if t not in stop]
-    tokens = tokens[:3]
+    stop = {
+        "spa", "s", "p", "a", "s.p.a", "s.p.a.", "srl", "s.r.l", "s.r.l.",
+        "societa", "società", "company", "group", "holding"
+    }
+    tokens = [t for t in raw_tokens if t not in stop][:3]
     primary = tokens[0] if tokens else ""
 
     best = ("NON TROVATO", 0.0)
 
     for dom in candidates[:6]:
+        # preferisci già il root domain come candidato (evita subdomain strani)
+        dom_root = to_root_domain(dom)
+        if is_blocked(dom_root):
+            continue
+
         try:
-            resp = requests.get(f"https://{dom}", timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+            resp = requests.get(f"https://{dom_root}", timeout=15, headers={"User-Agent": "Mozilla/5.0"})
             text = (resp.text or "").lower()
         except Exception:
             try:
-                resp = requests.get(f"http://{dom}", timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+                resp = requests.get(f"http://{dom_root}", timeout=15, headers={"User-Agent": "Mozilla/5.0"})
                 text = (resp.text or "").lower()
             except Exception:
                 continue
 
         score = 0.0
 
-        # 1) BOOST: il dominio contiene il token principale (ottimo segnale corporate)
-        if primary and primary in dom:
+        # BOOST: token nel dominio
+        if primary and primary in dom_root:
             score += 0.6
 
-        # 2) presenza token nella pagina (prudente)
+        # token nella pagina (prudente)
         token_hits = sum(1 for tok in tokens if tok and tok in text)
         if token_hits >= 2:
             score += 0.6
         elif token_hits == 1:
-            score += 0.25  # prudente: evita news/blog
+            score += 0.25
 
-        # 3) segnali corporate tipici
+        # segnali corporate
         if ("partita iva" in text) or ("p.iva" in text) or ("codice fiscale" in text) or ("vat" in text):
             score += 0.35
         if ("contatti" in text) or ("chi siamo" in text) or ("about" in text):
@@ -157,29 +180,28 @@ def pick_best_domain(company: str) -> Tuple[str, float]:
         if ("cookie" in text) or ("privacy" in text):
             score += 0.05
 
-        # 4) penalità per siti editoriali/portalosi
+        # penalità editoriali
         if ("news" in text) or ("newsletter" in text) or ("articolo" in text) or ("abbonati" in text):
             score -= 0.35
         if ("directory" in text) or ("scheda azienda" in text):
             score -= 0.5
 
-        # 5) regola anti-falso positivo: se ho solo 1 token e il dominio NON lo contiene,
-        # accetto solo con segnali legali (P.IVA/VAT) o ragione sociale completa nel testo
-        if len(tokens) <= 1 and primary and (primary not in dom):
+        # anti-falso positivo: se ho solo 1 token e il dominio NON lo contiene,
+        # accetto solo con segnali legali o ragione sociale completa
+        if len(tokens) <= 1 and primary and (primary not in dom_root):
             if not (("partita iva" in text) or ("p.iva" in text) or ("vat" in text) or (company.lower() in text)):
                 score -= 0.6
 
         if score > best[1]:
-            best = (dom, score)
+            best = (dom_root, score)
 
-        # stop early se molto convincente
         if best[1] >= 0.9:
             break
 
-    # Fallback: se score basso e token corto/forte (es. ima), prova primary.it e primary.com
+    # Fallback: se score basso e token corto/forte, prova primary.it e primary.com
     if best[1] < 0.75 and primary and 2 <= len(primary) <= 8:
         for tld in ("it", "com"):
-            guess = f"{primary}.{tld}"
+            guess = to_root_domain(f"{primary}.{tld}")
             if is_blocked(guess):
                 continue
             try:
@@ -197,7 +219,8 @@ def pick_best_domain(company: str) -> Tuple[str, float]:
 
     if best[1] < 0.75:
         return "NON TROVATO", best[1]
-    return best[0], best[1]
+
+    return to_root_domain(best[0]), best[1]
 
 
 def require_bearer_token(authorization: str | None) -> None:
@@ -214,7 +237,6 @@ def require_bearer_token(authorization: str | None) -> None:
 
 @app.post("/enrich/domains")
 def enrich_domains(req: EnrichRequest, authorization: str | None = Header(default=None)):
-    # Auth: Authorization: Bearer <APP_API_KEY>
     require_bearer_token(authorization)
 
     wb = Workbook()
