@@ -23,9 +23,11 @@ BLOCKED_DOMAINS = {
 
 app = FastAPI()
 
+
 class EnrichRequest(BaseModel):
     companies: List[str]
     output_filename: Optional[str] = "domini_compilati.xlsx"
+
 
 def normalize_domain(d: str) -> str:
     d = d.strip().lower()
@@ -39,6 +41,7 @@ def normalize_domain(d: str) -> str:
     d = re.sub(r"[^a-z0-9\.\-]", "", d)
     return d
 
+
 def is_blocked(domain: str) -> bool:
     dom = normalize_domain(domain)
     # blocco diretto e blocco su sottodomini
@@ -47,10 +50,9 @@ def is_blocked(domain: str) -> bool:
             return True
     return False
 
+
 def serpapi_search(company: str) -> List[str]:
-    """
-    Ritorna una lista di URL candidati (ordinati).
-    """
+    """Ritorna una lista di URL candidati (ordinati)."""
     if not SERPAPI_KEY:
         raise RuntimeError("SERPAPI_KEY non configurata")
 
@@ -73,12 +75,13 @@ def serpapi_search(company: str) -> List[str]:
             urls.append(link)
     return urls
 
+
 def pick_best_domain(company: str) -> Tuple[str, float]:
     """
-    Strategie prudente:
+    Strategia prudente:
     - prende domini dai primi risultati
     - scarta directory/terze parti
-    - prova a verificare che la home contenga un segnale minimo (name/brand)
+    - verifica leggera su homepage
     - se non supera soglia: NON TROVATO
     """
     try:
@@ -91,15 +94,12 @@ def pick_best_domain(company: str) -> Tuple[str, float]:
         host = normalize_domain(u)
         if not host or is_blocked(host):
             continue
-        # scarta host chiaramente non corporate (es: .pdf su dominio terzo) -> già coperto dai blocchi
         candidates.append(host)
 
     # de-dup preservando ordine
     seen = set()
     candidates = [c for c in candidates if not (c in seen or seen.add(c))]
 
-    # verifica leggera: scarica home e cerca occorrenza di una parola "forte"
-    # (non perfetto, ma meglio del “primo risultato”)
     tokens = [t for t in re.split(r"\W+", company.lower()) if len(t) >= 4][:3]
     best = ("NON TROVATO", 0.0)
 
@@ -108,7 +108,6 @@ def pick_best_domain(company: str) -> Tuple[str, float]:
             resp = requests.get(f"https://{dom}", timeout=15, headers={"User-Agent": "Mozilla/5.0"})
             text = (resp.text or "").lower()
         except Exception:
-            # prova http se https non va
             try:
                 resp = requests.get(f"http://{dom}", timeout=15, headers={"User-Agent": "Mozilla/5.0"})
                 text = (resp.text or "").lower()
@@ -116,22 +115,18 @@ def pick_best_domain(company: str) -> Tuple[str, float]:
                 continue
 
         score = 0.0
-        # segnali base
         if any(tok in text for tok in tokens):
             score += 0.7
         if "cookie" in text or "privacy" in text:
             score += 0.1
         if "contatti" in text or "chi siamo" in text or "about" in text:
             score += 0.1
-
-        # penalità: siti troppo “portalosi”
         if "directory" in text or "scheda azienda" in text:
             score -= 0.4
 
         if score > best[1]:
             best = (dom, score)
 
-        # soglia prudente: accetta solo se abbastanza convinto
         if best[1] >= 0.8:
             break
 
@@ -139,16 +134,23 @@ def pick_best_domain(company: str) -> Tuple[str, float]:
         return "NON TROVATO", best[1]
     return best[0], best[1]
 
-def require_api_key(x_api_key: str | None):
+
+def require_bearer_token(authorization: str | None) -> None:
     if not APP_API_KEY:
-        # se non settata, blocca comunque: meglio sicuro
         raise HTTPException(status_code=500, detail="APP_API_KEY non configurata sul server")
-    if not x_api_key or x_api_key != APP_API_KEY:
+
+    if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
+    token = authorization.split(" ", 1)[1].strip()
+    if token != APP_API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
 @app.post("/enrich/domains")
-def enrich_domains(req: EnrichRequest, x_api_key: Optional[str] = Header(default=None)):
-    require_api_key(x_api_key)
+def enrich_domains(req: EnrichRequest, authorization: str | None = Header(default=None)):
+    # Auth: Authorization: Bearer <APP_API_KEY>
+    require_bearer_token(authorization)
 
     wb = Workbook()
     ws = wb.active
@@ -174,6 +176,7 @@ def enrich_domains(req: EnrichRequest, x_api_key: Optional[str] = Header(default
             }
         ]
     }
+
 
 @app.get("/health")
 def health():
