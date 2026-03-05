@@ -13,6 +13,7 @@ from pydantic import BaseModel
 
 APP_API_KEY = os.getenv("APP_API_KEY", "")
 SERPAPI_KEY = os.getenv("SERPAPI_KEY", "")
+DEBUG_LOGS = os.getenv("DEBUG_LOGS", "0") == "1"
 
 # blocca directory / terze parti + news/magazine (falsi positivi frequenti)
 BLOCKED_DOMAINS = {
@@ -34,6 +35,11 @@ COMMON_TOKENS = {
     "dama", "vba", "mps", "re", "home", "spa", "srl",
 }
 
+# Throttling SerpAPI (stabilità)
+SERPAPI_QPS_DELAY = 1.0   # pausa tra chiamate SerpAPI (secondi)
+SERPAPI_429_SLEEP = 25    # pausa lunga se 429
+SERPAPI_TIMEOUT = 25
+
 app = FastAPI()
 
 
@@ -42,9 +48,13 @@ class EnrichRequest(BaseModel):
     output_filename: Optional[str] = "domini_compilati.xlsx"
 
 
+def _log(msg: str) -> None:
+    if DEBUG_LOGS:
+        print(msg, flush=True)
+
+
 def normalize_domain(d: str) -> str:
-    d = d.strip().lower()
-    d = d.replace("www.", "")
+    d = d.strip().lower().replace("www.", "")
     if "://" in d:
         d = urlparse(d).netloc.lower().replace("www.", "")
     d = d.split("/")[0]
@@ -57,11 +67,9 @@ def to_root_domain(dom: str) -> str:
     parts = dom.split(".")
     if len(parts) <= 2:
         return dom
-
     two_level_tlds = {"co.uk", "com.au", "co.jp", "com.br", "com.tr"}
     last2 = ".".join(parts[-2:])
     last3 = ".".join(parts[-3:])
-
     if last2 in two_level_tlds and len(parts) >= 3:
         return last3
     return last2
@@ -92,26 +100,22 @@ def tld_score_bonus(root_domain: str) -> float:
 
 def serpapi_search(company: str, mode: str = "it") -> List[str]:
     """
-    Ricerca SerpAPI con retry/backoff per stabilità (429/5xx/timeouts).
+    Ricerca SerpAPI con retry/backoff + throttling.
     mode:
-      - "it": passata base (corporate)
-      - "it_deep": passata più profonda (corporate + legal)
-      - "en": fallback inglese
+      - "it": base
+      - "it_deep": più profondo (solo se serve)
+      - "en": fallback inglese (solo se serve)
     """
     if not SERPAPI_KEY:
         raise RuntimeError("SERPAPI_KEY non configurata")
 
     if mode == "en":
-        queries = [
-            f"\"{company}\" official website",
-            f"\"{company}\" contact",
-        ]
+        queries = [f"\"{company}\" official website"]
         hl, gl = "en", "us"
     elif mode == "it_deep":
         queries = [
             f"\"{company}\" \"P.IVA\"",
             f"\"{company}\" \"partita IVA\"",
-            f"\"{company}\" \"privacy\"",
             f"\"{company}\" \"contatti\"",
         ]
         hl, gl = "it", "it"
@@ -119,7 +123,6 @@ def serpapi_search(company: str, mode: str = "it") -> List[str]:
         queries = [
             f"\"{company}\" sito ufficiale",
             f"\"{company}\" contatti",
-            f"\"{company}\" partita iva",
         ]
         hl, gl = "it", "it"
 
@@ -134,7 +137,8 @@ def serpapi_search(company: str, mode: str = "it") -> List[str]:
             "api_key": SERPAPI_KEY,
         }
 
-        backoffs = [0, 1.5, 3.5]
+        # backoff più lungo, soprattutto su 429
+        backoffs = [0, 2, 8, 20]
         last_err = None
 
         for wait_s in backoffs:
@@ -142,10 +146,22 @@ def serpapi_search(company: str, mode: str = "it") -> List[str]:
                 time.sleep(wait_s)
 
             try:
-                r = requests.get("https://serpapi.com/search.json", params=params, timeout=25)
+                _log(f"[SERPAPI] q={q}")
+                r = requests.get("https://serpapi.com/search.json", params=params, timeout=SERPAPI_TIMEOUT)
 
-                if r.status_code in (429, 500, 502, 503, 504):
+                # throttling tra chiamate SerpAPI
+                time.sleep(SERPAPI_QPS_DELAY)
+
+                if r.status_code == 429:
+                    _log("[SERPAPI] 429 rate limit -> sleep")
+                    last_err = RuntimeError("SerpAPI HTTP 429")
+                    time.sleep(SERPAPI_429_SLEEP)
+                    continue
+
+                if r.status_code in (500, 502, 503, 504):
+                    _log(f"[SERPAPI] {r.status_code} temporary -> retry")
                     last_err = RuntimeError(f"SerpAPI HTTP {r.status_code}")
+                    time.sleep(3)
                     continue
 
                 r.raise_for_status()
@@ -159,6 +175,7 @@ def serpapi_search(company: str, mode: str = "it") -> List[str]:
                 break
 
             except Exception as e:
+                _log(f"[SERPAPI] exception: {e}")
                 last_err = e
                 continue
 
@@ -172,9 +189,8 @@ def serpapi_search(company: str, mode: str = "it") -> List[str]:
 
 def fetch_text_multi(root_domain: str, timeout_s: int, deep: bool) -> Optional[str]:
     """
-    Scarica testo:
-    - base: solo homepage
-    - deep: homepage + /contatti /chi-siamo /about /privacy
+    base: homepage
+    deep: homepage + pagine corporate tipiche
     """
     def get(url: str) -> Optional[str]:
         try:
@@ -183,12 +199,8 @@ def fetch_text_multi(root_domain: str, timeout_s: int, deep: bool) -> Optional[s
         except Exception:
             return None
 
-    # prova https poi http
     base_urls = [f"https://{root_domain}", f"http://{root_domain}"]
-
-    paths = [""]
-    if deep:
-        paths += ["/contatti", "/chi-siamo", "/about", "/privacy", "/contacts", "/company"]
+    paths = [""] + (["/contatti", "/chi-siamo", "/about", "/privacy", "/contacts", "/company"] if deep else [])
 
     collected: List[str] = []
     for base in base_urls:
@@ -203,34 +215,21 @@ def fetch_text_multi(root_domain: str, timeout_s: int, deep: bool) -> Optional[s
 
     if not collected:
         return None
-
-    # concatena ma limita dimensione per non “esplodere”
-    joined = "\n".join(collected)
-    return joined[:250000]
+    return ("\n".join(collected))[:250000]
 
 
 def tokenize_company(company: str) -> Tuple[List[str], str]:
     raw_tokens = [t for t in re.split(r"\W+", company.lower()) if len(t) >= 3]
-    stop = {
-        "spa", "s", "p", "a", "s.p.a", "s.p.a.", "srl", "s.r.l", "s.r.l.",
-        "societa", "società", "company", "group", "holding"
-    }
+    stop = {"spa", "s", "p", "a", "s.p.a", "s.p.a.", "srl", "s.r.l", "s.r.l.", "societa", "società", "company", "group", "holding"}
     tokens = [t for t in raw_tokens if t not in stop][:3]
     primary = tokens[0] if tokens else ""
     return tokens, primary
 
 
 def is_safe_fallback_token(primary: str) -> bool:
-    if not primary:
-        return False
-    if len(primary) < 4:
-        return False
-    if primary.isdigit():
+    if not primary or len(primary) < 4:
         return False
     if primary in COMMON_TOKENS:
-        return False
-    # evita token “troppo italiani/comuni” molto frequenti in ragioni sociali
-    if primary in {"nuova", "italy", "italia", "impianti", "sistemi", "sistema", "service"}:
         return False
     return True
 
@@ -239,18 +238,15 @@ def score_domain(company: str, tokens: List[str], primary: str, dom_root: str, t
     score = 0.0
     score += tld_score_bonus(dom_root)
 
-    # boost: primary nel dominio (second-level)
     if primary and primary in dom_root:
         score += 0.6
 
-    # token nella pagina (prudente)
     token_hits = sum(1 for tok in tokens if tok and tok in text)
     if token_hits >= 2:
         score += 0.6
     elif token_hits == 1:
         score += 0.25
 
-    # segnali corporate
     if ("partita iva" in text) or ("p.iva" in text) or ("codice fiscale" in text) or ("vat" in text):
         score += 0.35
     if ("contatti" in text) or ("chi siamo" in text) or ("about" in text):
@@ -258,14 +254,11 @@ def score_domain(company: str, tokens: List[str], primary: str, dom_root: str, t
     if ("cookie" in text) or ("privacy" in text):
         score += 0.05
 
-    # penalità editoriali/portalose
     if ("news" in text) or ("newsletter" in text) or ("articolo" in text) or ("abbonati" in text):
         score -= 0.35
     if ("directory" in text) or ("scheda azienda" in text):
         score -= 0.5
 
-    # anti-falso positivo: se ho solo 1 token e il dominio NON lo contiene,
-    # accetto solo con segnali legali o ragione sociale completa
     if len(tokens) <= 1 and primary and (primary not in dom_root):
         if not (("partita iva" in text) or ("p.iva" in text) or ("vat" in text) or (company.lower() in text)):
             score -= 0.6
@@ -275,19 +268,18 @@ def score_domain(company: str, tokens: List[str], primary: str, dom_root: str, t
 
 def pick_best_domain(company: str) -> Tuple[str, float]:
     start = time.time()
-    MAX_SECONDS_PER_COMPANY = 25  # Profilo A: più tempo per trovare meglio
+    MAX_SECONDS_PER_COMPANY = 35  # Profilo A stabile
 
     def time_left() -> bool:
         return (time.time() - start) <= MAX_SECONDS_PER_COMPANY
 
     tokens, primary = tokenize_company(company)
 
-    # hard-fallback utile (STMicroelectronics -> st.com)
+    # fallback utile per ST
     if "stmicroelectronics" in company.lower() or "st microelectronics" in company.lower():
-        if time_left():
-            t = fetch_text_multi("st.com", timeout_s=7, deep=False)
-            if t and ("microelectronics" in t or "st.com" in t):
-                return "st.com", 0.95
+        t = fetch_text_multi("st.com", timeout_s=8, deep=False)
+        if t:
+            return "st.com", 0.95
 
     def evaluate(urls: List[str], deep_fetch: bool, max_candidates: int) -> Tuple[str, float]:
         candidates: List[str] = []
@@ -304,67 +296,63 @@ def pick_best_domain(company: str) -> Tuple[str, float]:
         candidates = [c for c in candidates if not (c in seen or seen.add(c))]
 
         best = ("NON TROVATO", 0.0)
-
         for dom_root in candidates[:max_candidates]:
             if not time_left():
                 break
-
-            text = fetch_text_multi(dom_root, timeout_s=10, deep=deep_fetch)
+            text = fetch_text_multi(dom_root, timeout_s=12, deep=deep_fetch)
             if not text:
                 continue
-
             sc = score_domain(company, tokens, primary, dom_root, text)
             if sc > best[1]:
                 best = (dom_root, sc)
-
             if best[1] >= 0.92:
                 break
-
         return best
 
-    # PASS 1: IT base (fetch leggero)
+    # PASS 1: IT base
     try:
         urls_it = serpapi_search(company, mode="it")
-    except Exception:
+    except Exception as e:
+        _log(f"[PICK] SerpAPI IT failed: {e}")
         urls_it = []
     best_dom, best_score = evaluate(urls_it, deep_fetch=False, max_candidates=4)
 
-    # Fallback sicuro: primary.it / primary.com solo se token è “sicuro”
-    if best_score < 0.78 and is_safe_fallback_token(primary) and time_left():
+    # fallback token sicuro primary.it/com (deep fetch)
+    if best_score < 0.80 and is_safe_fallback_token(primary) and time_left():
         for tld in ("it", "com"):
-            if not time_left():
-                break
             guess = to_root_domain(f"{primary}.{tld}")
             if is_blocked(guess):
                 continue
-            text = fetch_text_multi(guess, timeout_s=9, deep=True)  # deep qui, ma solo se token sicuro
+            text = fetch_text_multi(guess, timeout_s=10, deep=True)
             if not text:
                 continue
             sc = score_domain(company, tokens, primary, guess, text)
-            if sc >= 0.80:
+            if sc >= 0.82:
                 return guess, sc
 
-    # PASS 2: IT deep (solo se non trovato / score basso) + deep fetch + più candidati
-    if (best_dom == "NON TROVATO" or best_score < 0.80) and time_left():
+    # PASS 2: IT deep solo se serve
+    if (best_dom == "NON TROVATO" or best_score < 0.82) and time_left():
         try:
             urls_deep = serpapi_search(company, mode="it_deep")
-        except Exception:
+        except Exception as e:
+            _log(f"[PICK] SerpAPI IT_DEEP failed: {e}")
             urls_deep = []
         dom2, sc2 = evaluate(urls_deep, deep_fetch=True, max_candidates=6)
         if sc2 > best_score:
             best_dom, best_score = dom2, sc2
 
-    # PASS 3: EN fallback (solo se ancora basso)
-    if (best_dom == "NON TROVATO" or best_score < 0.80) and time_left():
+    # PASS 3: EN fallback solo se ancora basso
+    if (best_dom == "NON TROVATO" or best_score < 0.82) and time_left():
         try:
             urls_en = serpapi_search(company, mode="en")
-        except Exception:
+        except Exception as e:
+            _log(f"[PICK] SerpAPI EN failed: {e}")
             urls_en = []
         dom3, sc3 = evaluate(urls_en, deep_fetch=True, max_candidates=5)
         if sc3 > best_score:
             best_dom, best_score = dom3, sc3
 
-    if best_score < 0.80:
+    if best_score < 0.82:
         return "NON TROVATO", best_score
 
     return to_root_domain(best_dom), best_score
@@ -392,11 +380,17 @@ def enrich_domains(req: EnrichRequest, authorization: str | None = Header(defaul
 
     for i, name in enumerate(req.companies, start=2):
         ws[f"A{i}"] = name  # NON modificare
-        domain, _score = pick_best_domain(name)
+
+        try:
+            domain, _score = pick_best_domain(name)
+        except Exception as e:
+            _log(f"[ROW] error on '{name}': {e}")
+            domain = "NON TROVATO"
+
         ws[f"B{i}"] = domain if domain else "NON TROVATO"
 
-        # stabilità su run lunghi (anti-rate-limit)
-        time.sleep(0.25)
+        # stabilità su run lunghi (anti-rate-limit e anti-burst)
+        time.sleep(0.6)
 
     buf = io.BytesIO()
     wb.save(buf)
