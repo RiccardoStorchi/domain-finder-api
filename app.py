@@ -102,9 +102,10 @@ def serpapi_search(company: str, mode: str = "it") -> List[str]:
     """
     Ricerca SerpAPI con retry/backoff + throttling.
     mode:
-      - "it": base
-      - "it_deep": più profondo (solo se serve)
-      - "en": fallback inglese (solo se serve)
+      - "it": base (strict)
+      - "it_deep": più profondo (strict)
+      - "it_loose": più lasco (2° giro)
+      - "en": fallback inglese (strict/loose)
     """
     if not SERPAPI_KEY:
         raise RuntimeError("SERPAPI_KEY non configurata")
@@ -117,6 +118,14 @@ def serpapi_search(company: str, mode: str = "it") -> List[str]:
             f"\"{company}\" \"P.IVA\"",
             f"\"{company}\" \"partita IVA\"",
             f"\"{company}\" \"contatti\"",
+        ]
+        hl, gl = "it", "it"
+    elif mode == "it_loose":
+        # query meno rigide: aumenta recall nel 2° giro
+        queries = [
+            f"{company} sito ufficiale",
+            f"{company} azienda",
+            f"{company} contatti",
         ]
         hl, gl = "it", "it"
     else:
@@ -226,10 +235,23 @@ def tokenize_company(company: str) -> Tuple[List[str], str]:
     return tokens, primary
 
 
-def is_safe_fallback_token(primary: str) -> bool:
+def is_safe_fallback_token_strict(primary: str) -> bool:
+    # strict: molto prudente
     if not primary or len(primary) < 4:
         return False
     if primary in COMMON_TOKENS:
+        return False
+    return True
+
+
+def is_safe_fallback_token_loose(primary: str) -> bool:
+    # loose: leggermente più permissivo, ma sempre evita token comuni
+    if not primary or len(primary) < 5:
+        return False
+    if primary in COMMON_TOKENS:
+        return False
+    # evita token “troppo generici” anche se lunghi
+    if primary in {"general", "ricambi", "fluid", "team", "material", "handling"}:
         return False
     return True
 
@@ -259,6 +281,7 @@ def score_domain(company: str, tokens: List[str], primary: str, dom_root: str, t
     if ("directory" in text) or ("scheda azienda" in text):
         score -= 0.5
 
+    # anti-falso positivo se 1 token e dominio non contiene primary
     if len(tokens) <= 1 and primary and (primary not in dom_root):
         if not (("partita iva" in text) or ("p.iva" in text) or ("vat" in text) or (company.lower() in text)):
             score -= 0.6
@@ -266,9 +289,26 @@ def score_domain(company: str, tokens: List[str], primary: str, dom_root: str, t
     return score
 
 
-def pick_best_domain(company: str) -> Tuple[str, float]:
+def pick_best_domain(company: str, loose: bool = False) -> Tuple[str, float]:
     start = time.time()
-    MAX_SECONDS_PER_COMPANY = 35  # Profilo A stabile
+
+    # Parametri strict vs loose
+    if loose:
+        MAX_SECONDS_PER_COMPANY = 25
+        THRESHOLD = 0.72
+        BASE_MODE = "it_loose"
+        base_deep_fetch = True
+        base_candidates = 8
+        deep_candidates = 10
+        en_candidates = 8
+    else:
+        MAX_SECONDS_PER_COMPANY = 35
+        THRESHOLD = 0.82
+        BASE_MODE = "it"
+        base_deep_fetch = False
+        base_candidates = 4
+        deep_candidates = 6
+        en_candidates = 5
 
     def time_left() -> bool:
         return (time.time() - start) <= MAX_SECONDS_PER_COMPANY
@@ -305,54 +345,55 @@ def pick_best_domain(company: str) -> Tuple[str, float]:
             sc = score_domain(company, tokens, primary, dom_root, text)
             if sc > best[1]:
                 best = (dom_root, sc)
-            if best[1] >= 0.92:
+            if best[1] >= 0.92 and not loose:
                 break
         return best
 
-    # PASS 1: IT base
+    # PASS 1: base
     try:
-        urls_it = serpapi_search(company, mode="it")
+        urls_it = serpapi_search(company, mode=BASE_MODE)
     except Exception as e:
-        _log(f"[PICK] SerpAPI IT failed: {e}")
+        _log(f"[PICK] SerpAPI {BASE_MODE} failed: {e}")
         urls_it = []
-    best_dom, best_score = evaluate(urls_it, deep_fetch=False, max_candidates=4)
+    best_dom, best_score = evaluate(urls_it, deep_fetch=base_deep_fetch, max_candidates=base_candidates)
 
-    # fallback token sicuro primary.it/com (deep fetch)
-    if best_score < 0.80 and is_safe_fallback_token(primary) and time_left():
-        for tld in ("it", "com"):
-            guess = to_root_domain(f"{primary}.{tld}")
-            if is_blocked(guess):
-                continue
-            text = fetch_text_multi(guess, timeout_s=10, deep=True)
-            if not text:
-                continue
-            sc = score_domain(company, tokens, primary, guess, text)
-            if sc >= 0.82:
-                return guess, sc
+    # fallback primary.it/com
+    if best_score < THRESHOLD and time_left():
+        if (is_safe_fallback_token_loose(primary) if loose else is_safe_fallback_token_strict(primary)):
+            for tld in ("it", "com"):
+                guess = to_root_domain(f"{primary}.{tld}")
+                if is_blocked(guess):
+                    continue
+                text = fetch_text_multi(guess, timeout_s=10, deep=True)
+                if not text:
+                    continue
+                sc = score_domain(company, tokens, primary, guess, text)
+                if sc >= (0.76 if loose else 0.82):
+                    return guess, sc
 
-    # PASS 2: IT deep solo se serve
-    if (best_dom == "NON TROVATO" or best_score < 0.82) and time_left():
+    # PASS 2: it_deep se serve
+    if (best_dom == "NON TROVATO" or best_score < THRESHOLD) and time_left():
         try:
             urls_deep = serpapi_search(company, mode="it_deep")
         except Exception as e:
             _log(f"[PICK] SerpAPI IT_DEEP failed: {e}")
             urls_deep = []
-        dom2, sc2 = evaluate(urls_deep, deep_fetch=True, max_candidates=6)
+        dom2, sc2 = evaluate(urls_deep, deep_fetch=True, max_candidates=deep_candidates)
         if sc2 > best_score:
             best_dom, best_score = dom2, sc2
 
-    # PASS 3: EN fallback solo se ancora basso
-    if (best_dom == "NON TROVATO" or best_score < 0.82) and time_left():
+    # PASS 3: EN fallback se serve (loose: aiuta parecchio)
+    if (best_dom == "NON TROVATO" or best_score < THRESHOLD) and time_left():
         try:
             urls_en = serpapi_search(company, mode="en")
         except Exception as e:
             _log(f"[PICK] SerpAPI EN failed: {e}")
             urls_en = []
-        dom3, sc3 = evaluate(urls_en, deep_fetch=True, max_candidates=5)
+        dom3, sc3 = evaluate(urls_en, deep_fetch=True, max_candidates=en_candidates)
         if sc3 > best_score:
             best_dom, best_score = dom3, sc3
 
-    if best_score < 0.82:
+    if best_score < THRESHOLD:
         return "NON TROVATO", best_score
 
     return to_root_domain(best_dom), best_score
@@ -382,7 +423,12 @@ def enrich_domains(req: EnrichRequest, authorization: str | None = Header(defaul
         ws[f"A{i}"] = name  # NON modificare
 
         try:
-            domain, _score = pick_best_domain(name)
+            domain, _score = pick_best_domain(name, loose=False)
+            if domain == "NON TROVATO":
+                # secondo giro SOLO sui NON TROVATO
+                domain2, _score2 = pick_best_domain(name, loose=True)
+                if domain2 != "NON TROVATO":
+                    domain = domain2
         except Exception as e:
             _log(f"[ROW] error on '{name}': {e}")
             domain = "NON TROVATO"
