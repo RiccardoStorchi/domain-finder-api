@@ -55,22 +55,14 @@ class EnrichRequest(BaseModel):
 def normalize_domain(d: str) -> str:
     d = d.strip().lower()
     d = d.replace("www.", "")
-    # se arriva un URL, estrai host
     if "://" in d:
         d = urlparse(d).netloc.lower().replace("www.", "")
-    # togli path se presente
     d = d.split("/")[0]
-    # pulizia base
     d = re.sub(r"[^a-z0-9\.\-]", "", d)
     return d
 
 
 def to_root_domain(dom: str) -> str:
-    """
-    Converte sottodomini in root domain:
-    - carconfigurator.ferrari.com -> ferrari.com
-    - sub.company.co.uk -> company.co.uk
-    """
     dom = normalize_domain(dom)
     parts = dom.split(".")
     if len(parts) <= 2:
@@ -94,7 +86,6 @@ def is_blocked(domain: str) -> bool:
 
 
 def tld_score_bonus(root_domain: str) -> float:
-    """Preferenze TLD: .com/.it meglio di .net/.info ecc."""
     d = normalize_domain(root_domain)
     if d.endswith(".com"):
         return 0.18
@@ -111,29 +102,23 @@ def tld_score_bonus(root_domain: str) -> float:
 
 def serpapi_search(company: str, mode: str = "it") -> List[str]:
     """
-    Ritorna URL candidati (ordinati).
+    Ricerca SerpAPI con retry/backoff per stabilità (429/5xx/timeouts).
     mode:
-      - "it": query italiane (corporate)
-      - "en": query inglese (fallback)
+      - "it": query italiane corporate
+      - "en": fallback inglese
     """
     if not SERPAPI_KEY:
         raise RuntimeError("SERPAPI_KEY non configurata")
 
     if mode == "en":
-        queries = [
-            f"\"{company}\" official website",
-            f"\"{company}\" contacts",
-        ]
+        queries = [f"\"{company}\" official website", f"\"{company}\" contacts"]
         hl, gl = "en", "us"
     else:
-        queries = [
-            f"\"{company}\" sito ufficiale",
-            f"\"{company}\" contatti",
-            f"\"{company}\" partita iva",
-        ]
+        queries = [f"\"{company}\" sito ufficiale", f"\"{company}\" contatti", f"\"{company}\" partita iva"]
         hl, gl = "it", "it"
 
     urls: List[str] = []
+
     for q in queries:
         params = {
             "engine": "google",
@@ -143,13 +128,38 @@ def serpapi_search(company: str, mode: str = "it") -> List[str]:
             "num": 10,
             "api_key": SERPAPI_KEY,
         }
-        r = requests.get("https://serpapi.com/search.json", params=params, timeout=25)
-        r.raise_for_status()
-        data = r.json()
-        for item in (data.get("organic_results") or []):
-            link = item.get("link")
-            if link:
-                urls.append(link)
+
+        backoffs = [0, 1.5, 3.5]  # secondi
+        last_err = None
+
+        for wait_s in backoffs:
+            if wait_s:
+                time.sleep(wait_s)
+
+            try:
+                r = requests.get("https://serpapi.com/search.json", params=params, timeout=25)
+
+                # rate limit / temporanei -> retry
+                if r.status_code in (429, 500, 502, 503, 504):
+                    last_err = RuntimeError(f"SerpAPI HTTP {r.status_code}")
+                    continue
+
+                r.raise_for_status()
+                data = r.json()
+                for item in (data.get("organic_results") or []):
+                    link = item.get("link")
+                    if link:
+                        urls.append(link)
+
+                last_err = None
+                break
+
+            except Exception as e:
+                last_err = e
+                continue
+
+        if last_err is not None:
+            raise last_err
 
     seen = set()
     urls = [u for u in urls if not (u in seen or seen.add(u))]
@@ -157,35 +167,20 @@ def serpapi_search(company: str, mode: str = "it") -> List[str]:
 
 
 def fetch_homepage_text(root_domain: str, timeout_s: int = 8) -> Optional[str]:
-    """Scarica la home page e ritorna il testo (lower)."""
     try:
-        resp = requests.get(
-            f"https://{root_domain}", timeout=timeout_s, headers={"User-Agent": "Mozilla/5.0"}
-        )
+        resp = requests.get(f"https://{root_domain}", timeout=timeout_s, headers={"User-Agent": "Mozilla/5.0"})
         return (resp.text or "").lower()
     except Exception:
         try:
-            resp = requests.get(
-                f"http://{root_domain}", timeout=timeout_s, headers={"User-Agent": "Mozilla/5.0"}
-            )
+            resp = requests.get(f"http://{root_domain}", timeout=timeout_s, headers={"User-Agent": "Mozilla/5.0"})
             return (resp.text or "").lower()
         except Exception:
             return None
 
 
 def pick_best_domain(company: str) -> Tuple[str, float]:
-    """
-    Strategia prudente:
-    - prende domini dai risultati
-    - scarta directory/terze parti/news
-    - scoring severo se nome generico (1 token)
-    - fallback: prova primary.it / primary.com
-    - fallback EN query se NON TROVATO
-    - normalizza sempre a root domain
-    - time budget per evitare hang
-    """
     start = time.time()
-    MAX_SECONDS_PER_COMPANY = 14  # budget per azienda (evita blocchi lunghi)
+    MAX_SECONDS_PER_COMPANY = 20  # più alto per qualità/stabilità
 
     def time_left() -> bool:
         return (time.time() - start) <= MAX_SECONDS_PER_COMPANY
@@ -193,34 +188,20 @@ def pick_best_domain(company: str) -> Tuple[str, float]:
     # tokenizzazione
     raw_tokens = [t for t in re.split(r"\W+", company.lower()) if len(t) >= 3]
     stop = {
-        "spa",
-        "s",
-        "p",
-        "a",
-        "s.p.a",
-        "s.p.a.",
-        "srl",
-        "s.r.l",
-        "s.r.l.",
-        "societa",
-        "società",
-        "company",
-        "group",
-        "holding",
+        "spa", "s", "p", "a", "s.p.a", "s.p.a.", "srl", "s.r.l", "s.r.l.",
+        "societa", "società", "company", "group", "holding"
     }
     tokens = [t for t in raw_tokens if t not in stop][:3]
     primary = tokens[0] if tokens else ""
 
     # hard-fallback utile (STMicroelectronics -> st.com)
-    # (non obbligatorio, ma molto efficace e non “pericoloso”)
     if "stmicroelectronics" in company.lower() or "st microelectronics" in company.lower():
-        # se abbiamo tempo, prova al volo st.com
         if time_left():
             st_text = fetch_homepage_text("st.com", timeout_s=6)
-            if st_text and ("st" in st_text or "microelectronics" in st_text):
-                return "st.com", 0.9
+            if st_text and ("microelectronics" in st_text or "st.com" in st_text or "st " in st_text):
+                return "st.com", 0.95
 
-    def evaluate_candidates(urls: List[str]) -> Tuple[str, float]:
+    def evaluate_urls(urls: List[str]) -> Tuple[str, float]:
         candidates: List[str] = []
         for u in urls:
             host = normalize_domain(u)
@@ -236,24 +217,22 @@ def pick_best_domain(company: str) -> Tuple[str, float]:
 
         best = ("NON TROVATO", 0.0)
 
-        for dom_root in candidates[:3]:
+        for dom_root in candidates[:4]:
             if not time_left():
                 break
 
-            text = fetch_homepage_text(dom_root, timeout_s=8)
+            text = fetch_homepage_text(dom_root, timeout_s=10)
             if not text:
                 continue
 
             score = 0.0
-
-            # boost TLD preference
             score += tld_score_bonus(dom_root)
 
-            # boost: token nel dominio
+            # boost token nel dominio
             if primary and primary in dom_root:
                 score += 0.6
 
-            # token nella pagina (prudente)
+            # token nella pagina
             token_hits = sum(1 for tok in tokens if tok and tok in text)
             if token_hits >= 2:
                 score += 0.6
@@ -274,8 +253,7 @@ def pick_best_domain(company: str) -> Tuple[str, float]:
             if ("directory" in text) or ("scheda azienda" in text):
                 score -= 0.5
 
-            # anti-falso positivo: se ho solo 1 token e il dominio NON lo contiene,
-            # accetto solo con segnali legali o ragione sociale completa
+            # anti-falso positivo se 1 token e dominio non contiene primary
             if len(tokens) <= 1 and primary and (primary not in dom_root):
                 if not (("partita iva" in text) or ("p.iva" in text) or ("vat" in text) or (company.lower() in text)):
                     score -= 0.6
@@ -288,15 +266,15 @@ def pick_best_domain(company: str) -> Tuple[str, float]:
 
         return best
 
-    # 1) ricerca IT
+    # 1) IT
     try:
         urls_it = serpapi_search(company, mode="it")
     except Exception:
         urls_it = []
 
-    best_dom, best_score = evaluate_candidates(urls_it)
+    best_dom, best_score = evaluate_urls(urls_it)
 
-    # 2) fallback: prova primary.it / primary.com se score basso
+    # 2) fallback primary.it/.com
     if best_score < 0.78 and primary and 2 <= len(primary) <= 10 and time_left():
         for tld in ("it", "com"):
             if not time_left():
@@ -304,20 +282,19 @@ def pick_best_domain(company: str) -> Tuple[str, float]:
             guess = to_root_domain(f"{primary}.{tld}")
             if is_blocked(guess):
                 continue
-            text = fetch_homepage_text(guess, timeout_s=7)
+            text = fetch_homepage_text(guess, timeout_s=9)
             if not text:
                 continue
             if ("partita iva" in text) or ("p.iva" in text) or ("vat" in text) or (primary in text):
-                # applica bonus TLD e torna
-                return to_root_domain(guess), 0.85 + tld_score_bonus(guess)
+                return guess, 0.85 + tld_score_bonus(guess)
 
-    # 3) fallback EN se ancora NON TROVATO o score basso
+    # 3) fallback EN se basso
     if (best_dom == "NON TROVATO" or best_score < 0.78) and time_left():
         try:
             urls_en = serpapi_search(company, mode="en")
         except Exception:
             urls_en = []
-        dom2, sc2 = evaluate_candidates(urls_en)
+        dom2, sc2 = evaluate_urls(urls_en)
         if sc2 > best_score:
             best_dom, best_score = dom2, sc2
 
@@ -353,6 +330,9 @@ def enrich_domains(req: EnrichRequest, authorization: str | None = Header(defaul
         ws[f"A{i}"] = name  # NON modificare
         domain, _score = pick_best_domain(name)
         ws[f"B{i}"] = domain if domain else "NON TROVATO"
+
+        # micro delay: riduce rate limit e rende più stabile su run lunghi
+        time.sleep(0.25)
 
     buf = io.BytesIO()
     wb.save(buf)
